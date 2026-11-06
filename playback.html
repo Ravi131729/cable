@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Cable pendulum</title>
+<style>
+body{font:16px system-ui;background:#101821;color:#e5edf6;max-width:1000px;margin:32px auto;padding:0 16px}canvas{width:100%;background:#16232f;border-radius:12px}button,input{font:inherit}input{width:65%}button{padding:7px 18px}#readout{font-variant-numeric:tabular-nums;margin:12px 0}
+</style>
+<h1>Cable pendulum — horizontal release</h1>
+<p id="parameters">10 m cable · 0.03 kg/m · 1 kg bob · top pinned · bending and torsion enabled</p>
+<canvas id="scene" width="960" height="620" role="img" aria-label="Recorded Newton cable pendulum motion in the X Z plane"></canvas>
+<p><button id="play">Play</button> <label>Time <input id="time" type="range" min="0" max="1" value="0" step="1"></label></p>
+<div id="readout"></div>
+<script>
+const data=/*SIMULATION_DATA*/null;
+const canvas=document.getElementById('scene'),ctx=canvas.getContext('2d'),slider=document.getElementById('time'),button=document.getElementById('play'),readout=document.getElementById('readout');
+let playing=false, frame=0,last=0;
+if(data){slider.max=data.time.length-1;
+if(data.parameters){const p=data.parameters;document.getElementById('parameters').textContent=`${p.length} m cable · ${p.linear_density} kg/m · ${p.bob_mass} kg bob · EI ${p.ei} N·m² · GJ ${p.gj} N·m²`;document.querySelector('h1').textContent=`Cable pendulum — ${p.angle}° release`}
+const L=data.length, scale=Math.min(860/(2.3*L),520/(1.35*L));
+function xy(p){return [480+p[0]*scale,70+(data.pivot[2]-p[2])*scale]}
+function draw(){ctx.clearRect(0,0,960,620);ctx.font='14px system-ui';ctx.lineWidth=1;ctx.strokeStyle='#334454';ctx.fillStyle='#afbdca';
+for(let x=-L;x<=L;x+=2){const a=xy([x,0,data.pivot[2]]);ctx.beginPath();ctx.moveTo(a[0],45);ctx.lineTo(a[0],570);ctx.stroke();ctx.fillText(x+' m',a[0]-12,597)}
+for(let z=0;z<=L;z+=2){const a=xy([0,0,data.pivot[2]-z]);ctx.beginPath();ctx.moveTo(40,a[1]);ctx.lineTo(920,a[1]);ctx.stroke();ctx.fillText(-z+' m',4,a[1]+5)}
+ctx.strokeStyle='#f5bb55';ctx.lineWidth=4;ctx.beginPath();data.nodes[frame].forEach((p,i)=>{const a=xy(p);i?ctx.lineTo(...a):ctx.moveTo(...a)});ctx.stroke();
+const p=xy(data.bob[frame]);ctx.fillStyle='#6fbaff';ctx.beginPath();ctx.arc(...p,10,0,Math.PI*2);ctx.fill();const a=xy(data.pivot);ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(...a,5,0,Math.PI*2);ctx.fill();ctx.fillText('Fixed top',a[0]+12,a[1]-12);ctx.fillText('x (m)',855,618);
+slider.value=frame;readout.textContent=`t = ${data.time[frame].toFixed(2)} s · bob speed = ${data.speed[frame].toFixed(2)} m/s`}
+slider.oninput=()=>{frame=Number(slider.value);draw()};button.onclick=()=>{if(frame>=data.time.length-1)frame=0;playing=!playing;button.textContent=playing?'Pause':'Play';last=0};
+function tick(now){if(playing){if(!last)last=now;const advance=Math.floor((now-last)/1000/(data.time[1]-data.time[0]));if(advance){frame=Math.min(frame+advance,data.time.length-1);last=now;draw();if(frame===data.time.length-1){playing=false;button.textContent='Play'}}}requestAnimationFrame(tick)}draw();requestAnimationFrame(tick);
+}
+</script></html>

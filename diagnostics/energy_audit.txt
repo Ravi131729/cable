@@ -1,0 +1,10 @@
+Energy audit: 10 m cable, 0.03 kg/m, 1 kg bob; physical damping remains zero.
+Analytical checks cover kinetic energy, gravity, finite-angle bending, and twist.
+Full-run baseline: 11.23% maximum absolute drift. Energy zero remains at the visual floor.
+Best tested 40-segment setting: 80 iterations, 20 substeps, lambda-retention 0.
+That setting reached 4.88% maximum drift and -4.61% final drift over 10 seconds.
+No tested setting established less than 1% full-run conservation.
+Higher iterations and smaller timesteps did not monotonically reduce error.
+Defaults are unchanged. Numerical warm-start retention is exposed as an optional parameter.
+For exploratory RL: randomize physical parameters separately from numerical settings and evaluate policies across solver/timestep settings.
+Full comparison: energy_comparison.json. Physical stiffnesses and masses were held fixed in these comparisons; spatial segment counts are explicitly reported.

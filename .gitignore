@@ -1,0 +1,24 @@
+# Local Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated simulations, animations, screenshots, and benchmark runs
+/results/
+/results_*/
+/diagnostics/*
+!/diagnostics/energy_audit.txt
+!/diagnostics/energy_comparison.json
+imgui.ini
+*.log
+
+# Local secrets and operating-system files
+.env
+.env.*
+!.env.example
+.DS_Store
