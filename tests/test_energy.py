@@ -1,6 +1,11 @@
 """Check energy accounting against simple analytical states, independently of dynamics."""
 import math
+import contextlib
+import io
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -30,6 +35,10 @@ class EnergyAccounting(unittest.TestCase):
     def setUp(self):
         self.p.state_0.body_q.assign(self.rest)
         self.p.state_0.body_qd.zero_()
+        for samples in [self.p.rows, self.p.transforms, self.p.nodes, self.p.velocities,
+                        self.p.energies, self.p.endpoint_history]:
+            samples.clear()
+        self.p.args.strict_validation = False
 
     def measure(self):
         self.p.sample()
@@ -78,6 +87,66 @@ class EnergyAccounting(unittest.TestCase):
         self.p.state_0.body_q.assign(q)
         expected = .02 / self.p.ds * .1**2
         self.assertAlmostEqual(self.measure()['cable_twist_J'], expected, places=7)
+
+    def test_endpoint_loads_in_static_hanging_configuration(self):
+        q = self.rest.copy()
+        n = len(self.p.bodies)
+        segment_mass = .3 / n
+        tension = 1.3 * 9.81
+        z = -tension / self.p.attachment_stiffness
+        for i, body in enumerate(self.p.bodies):
+            if i:
+                tension = (1 + (n - i) * segment_mass) * 9.81
+                z -= tension / (self.p.args.ea / self.p.ds)
+            q[body, :3] = (0, 0, z - self.p.ds / 2)
+            q[body, 3:] = (0, 1, 0, 0)
+            z -= self.p.ds
+        q[self.p.bob, :3] = (0, 0, z - 9.81 / self.p.attachment_stiffness)
+        q[self.p.bob, 3:] = (0, 1, 0, 0)
+        self.p.state_0.body_q.assign(q)
+        self.measure()
+        load = self.p.endpoint_history[-1][-1]
+        self.assertAlmostEqual(load[1], 1.3 * 9.81, delta=.01)
+        self.assertAlmostEqual(load[2], 9.81, delta=.1)
+        self.assertGreater(load[3], 0)
+        self.assertGreater(load[4], 0)
+
+    def test_endpoint_compression_has_positive_magnitude_and_negative_axial_load(self):
+        q = self.rest.copy()
+        q[self.p.bob, 0] -= .001
+        self.p.state_0.body_q.assign(q)
+        self.measure()
+        load = self.p.endpoint_history[-1][-1]
+        self.assertAlmostEqual(load[2], 100, delta=.1)
+        self.assertLess(load[4], 0)
+
+    def test_failed_validation_preserves_results(self):
+        q = self.rest.copy()
+        q[0, 0] += .02
+        self.p.state_0.body_q.assign(q)
+        self.measure()
+        with tempfile.TemporaryDirectory() as folder:
+            self.p.args.output = folder
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.p.save()
+            summary = json.loads((Path(folder) / 'summary.json').read_text())
+            self.assertFalse(summary['constraint_validation']['passed'])
+            self.assertTrue((Path(folder) / 'pendulum.html').is_file())
+            self.assertTrue((Path(folder) / 'energies.csv').is_file())
+            self.assertTrue((Path(folder) / 'tensions.csv').is_file())
+
+    def test_strict_validation_still_raises_after_saving(self):
+        q = self.rest.copy()
+        q[0, 0] += .02
+        self.p.state_0.body_q.assign(q)
+        self.measure()
+        self.p.args.strict_validation = True
+        with tempfile.TemporaryDirectory() as folder:
+            self.p.args.output = folder
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'failed constraint validation'):
+                    self.p.save()
+            self.assertTrue((Path(folder) / 'summary.json').is_file())
 
 
 if __name__ == '__main__':

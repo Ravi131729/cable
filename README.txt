@@ -17,6 +17,9 @@ Run with Viser's browser-based 3D viewer:
   Open http://localhost:8080 and uncheck Pause to release the pendulum.
   After the simulation, use Recorded pendulum / Frame or Play recording.
   The server stays open until Ctrl+C. Use --port 8081 for a different port.
+  Failed attachment validation is shown in Viser and saved in summary.json;
+  replay remains available for diagnosis. Use --strict-validation to require
+  an unsuccessful exit for such runs (for example, in automated data collection).
   For unattended runs: --autoplay --exit-on-finish.
   The Viser scene uses a dark navy background, amber cable, blue bob, and a
   visual floor 1 m below the lowest nominal cable endpoint (no floor contact).
@@ -30,6 +33,14 @@ Run with Viser's browser-based 3D viewer:
   strain definition and the authored joint stiffnesses, including shear.
   System total includes finite pin/bob attachment spring energy. These graphs
   update while simulating and while scrubbing recorded playback.
+  Endpoint tension / loads plots pivot and bob attachment-force magnitudes in N.
+  The elastic attachment law is F = k * displacement (k = 100000 N/m).
+  These resultants include shear/compression; they are material-force estimates,
+  not raw numerical ALM multipliers. Signed axial components are also exported
+  (positive tension, negative compression). Every physics substep is recorded,
+  including between display frames, so short force spikes remain in the history.
+  Load histories update during live simulation and recorded playback; failed
+  physics validation also applies to the reliability of these force estimates.
 
 Open results/pendulum.html in a browser for recorded playback with Play/Pause
 and a time slider. This playback displays recorded Newton states; it does not
@@ -48,8 +59,13 @@ Model
   The top endpoint has a frictionless spherical joint to the world: fixed
   position, free orientation. It is not an orientation-clamped cantilever.
   The bob center coincides with the cable endpoint and is rigidly attached.
-  Initial configuration: straight horizontal cable, zero linear/angular velocity,
+  Initial configuration: straight cable at --angle, zero linear/angular velocity,
   no pretwist; all temporary supports removed at t=0. Gravity is -9.81 m/s^2.
+  Angles are measured from DOWNWARD vertical: 0 hangs down, 90 is horizontal,
+  and 160 points mostly upward. Use --angle 90 to reproduce the original run.
+  Above-horizontal releases can buckle and become slack before a sharp tension
+  transient; they require separate numerical validation. Domain randomization
+  does not make large energy loss or failed attachment validation acceptable.
   No ground, air drag, self-collision, or prescribed physical damping is added.
   The symmetric motion is planar. Torsional stiffness is active but no torsional
   excitation is imposed, so zero twist is expected for this release.
@@ -61,6 +77,9 @@ Outputs
     energy; do not interpret this column as total mechanical energy).
   results/energies.csv: separate cable/bob energy terms, attachment elastic
     energy, total mechanical energy, and change from initial total.
+  results/tensions.csv: physics-substep time, pivot/bob force magnitudes, signed
+    axial loads, and world force vectors. Pivot vector is force ON the cable;
+    bob vector is force ON the bob. The support reaction has the opposite sign.
   results/states.npz: time, body positions/quaternions (XYZ, quaternion XYZW),
     linear/angular velocities, cable centerline nodes, and energy components,
     including the initial state.
@@ -80,11 +99,13 @@ Numerical limits
   and numerical energy drift remain. This is an illustrative simulation using
   assumed material properties, not a validated prediction for a specific cable.
   Compare timestep, iteration, and spatial resolution before using numerical
-  values for engineering decisions. The script rejects nonfinite states and
-  attachment errors above 1 cm.
+  values for engineering decisions. Nonfinite states stop the simulation;
+  attachment errors above 1 cm fail validation and generate a warning (or an
+  exception when --strict-validation is enabled).
 
 Verification of saved run
-  10 seconds on RTX 3090, 60 frames/s, 20 substeps/frame, 40 VBD iterations.
+  Original 90-degree run: 10 seconds on RTX 3090, 60 frames/s,
+  20 substeps/frame, 40 VBD iterations.
   Maximum bob speed: 14.7496 m/s.
   Maximum top pin error: 2.86 mm; maximum interbody attachment gap: 2.52 mm.
   Doubling iterations to 80 over the first 2.5 seconds changes peak speed by

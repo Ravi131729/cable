@@ -1,4 +1,4 @@
-"""Newton cable pendulum: SI units, Z up, horizontal release from rest."""
+"""Newton cable pendulum: SI units, Z up, release from rest at a specified angle."""
 
 import argparse
 import csv
@@ -22,6 +22,27 @@ def rod_strains(body_q: wp.array[wp.transform], bodies: wp.array[int],
     qa = wp.transform_get_rotation(body_q[bodies[i]])
     qb = wp.transform_get_rotation(body_q[bodies[i + 1]])
     strains[i] = compute_geometric_rod_kappa_cached_z(qa, qb, wp.vec3(0.0), 0.0)
+
+
+@wp.kernel
+def record_endpoint_loads(body_q: wp.array[wp.transform], first: int, last: int,
+                          bob: int, half_length: float, pivot: wp.vec3, stiffness: float,
+                          substep: int, forces: wp.array(dtype=wp.vec3, ndim=2),
+                          axial: wp.array(dtype=float, ndim=2)):
+    end = wp.tid()
+    body = first
+    local_z = -half_length
+    if end == 1:
+        body = last
+        local_z = half_length
+    pose = body_q[body]
+    anchor = wp.transform_point(pose, wp.vec3(0.0, 0.0, local_z))
+    force = stiffness * (pivot - anchor)  # Force exerted by pivot on cable.
+    if end == 1:
+        force = stiffness * (anchor - wp.transform_get_translation(body_q[bob]))
+    tangent = wp.quat_rotate(wp.transform_get_rotation(pose), wp.vec3(0.0, 0.0, 1.0))
+    forces[substep, end] = force  # At bob: force exerted by cable on bob.
+    axial[substep, end] = -wp.dot(force, tangent)  # Positive tension, negative compression.
 
 
 ENERGY_COLUMNS = ('cable_kinetic_J', 'cable_gravity_J', 'cable_stretch_J',
@@ -96,10 +117,11 @@ class Pendulum:
         builder.add_articulation(joints)
         builder.color()
         self.model = builder.finalize()
+        self.attachment_stiffness = 1e5
         self.solver = newton.solvers.SolverVBD(self.model, iterations=args.iterations,
                                                 rigid_compliant_alm=True,
                                                 rigid_avbd_gamma=getattr(args, 'lambda_retention', 0.999),
-                                                rigid_joint_linear_ke=1e5,
+                                                rigid_joint_linear_ke=self.attachment_stiffness,
                                                 rigid_joint_angular_ke=1e5)
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.control = self.model.control()
@@ -108,6 +130,9 @@ class Pendulum:
         self.energy_bodies = wp.array(self.bodies, dtype=int, device=self.model.device)
         self.energy_strains = wp.empty(args.segments - 1, dtype=wp.vec3, device=self.model.device)
         self.energies = []
+        self.endpoint_forces = wp.zeros((args.substeps, 2), dtype=wp.vec3, device=self.model.device)
+        self.endpoint_axial = wp.zeros((args.substeps, 2), dtype=float, device=self.model.device)
+        self.endpoint_history = []
         self._energy_plot_frame = None
         self.viewer.set_model(self.model)
         self.viewer.set_camera(pos=wp.vec3(0, -26, -args.length / 2), pitch=0, yaw=90)
@@ -122,10 +147,17 @@ class Pendulum:
         self.rows, self.transforms, self.nodes, self.velocities = [], [], [], []
 
     def simulate(self):
-        for _ in range(self.args.substeps):
+        for substep in range(self.args.substeps):
             self.state_0.clear_forces()
             self.solver.step(self.state_0, self.state_1, self.control, None, self.dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
+            self.record_loads(substep)
+
+    def record_loads(self, substep):
+        wp.launch(record_endpoint_loads, dim=2,
+                  inputs=[self.state_0.body_q, int(self.bodies[0]), int(self.bodies[-1]),
+                          self.bob, self.ds / 2, wp.vec3(*self.pivot), self.attachment_stiffness,
+                          substep], outputs=[self.endpoint_forces, self.endpoint_axial])
 
     def sample(self):
         transforms = self.state_0.body_q.numpy().copy()
@@ -182,6 +214,18 @@ class Pendulum:
         self.transforms.append(transforms)
         self.velocities.append(velocities)
         self.nodes.append(np.vstack((starts, ends[-1])))
+        if self.time == 0:
+            self.record_loads(0)
+            times = np.array([0.0])
+            forces = self.endpoint_forces.numpy()[:1].copy()
+            axial = self.endpoint_axial.numpy()[:1].copy()
+        else:
+            times = self.time - 1 / self.args.fps + np.arange(1, self.args.substeps + 1) * self.dt
+            forces = self.endpoint_forces.numpy().copy()
+            axial = self.endpoint_axial.numpy().copy()
+        magnitudes = np.linalg.norm(forces, axis=2)
+        self.endpoint_history.append(np.column_stack((times, magnitudes, axial,
+                                                       forces[:, 0, :], forces[:, 1, :])))
 
     def run(self):
         self.sample()
@@ -300,6 +344,14 @@ class Pendulum:
             server.gui.add_markdown('Time in seconds; energy in joules. Gravity is zero at the visual floor. '
                                     'Kinetic includes translation and rotation. System total includes attachment compliance.')
             self.energy_readout = server.gui.add_markdown('Waiting for initial energy sample.')
+        self.load_folder = server.gui.add_folder('Endpoint tension / loads', expand_by_default=True)
+        with self.load_folder:
+            server.gui.add_markdown(
+                'Resultant attachment force **|F|**, in newtons, sampled every physics substep. '
+                'Computed from the elastic attachment law, F = k × displacement; includes shear/compression. '
+                'These are material-force estimates, not raw ALM multipliers or validated impact loads.')
+            self.load_readout = server.gui.add_markdown('Waiting for initial load sample.')
+        self.load_chart = None
 
     def update_energy_plots(self, frame):
         if self._energy_plot_frame == frame:
@@ -325,10 +377,38 @@ class Pendulum:
                 self.energy_charts[title].data = arrays
         drift = values[-1, -1]
         initial = self.energies[0][-2]
+        pin_error = max(r[5] for r in self.rows[:frame + 1])
+        gap_error = max(r[6] for r in self.rows[:frame + 1])
+        constraint_status = ('**FAILED: attachment tolerance exceeded**'
+                             if max(pin_error, gap_error) > 0.01 else 'Within 1 cm attachment tolerance')
         self.energy_readout.content = (f'**t = {times[-1]:.2f} s** · total **{values[-1, -2]:.3f} J**  \n'
                                        f'Change from initial: **{drift:+.3f} J ({100 * drift / initial:+.2f}%)**  \n'
-                                       f'Maximum drift so far: **{100 * np.max(np.abs(values[:, -1])) / initial:.2f}%**')
+                                       f'Maximum drift so far: **{100 * np.max(np.abs(values[:, -1])) / initial:.2f}%**  \n'
+                                       f'{constraint_status}  \n'
+                                       f'Peak pin displacement: {1000 * pin_error:.2f} mm; '
+                                       f'peak cable/bob gap: {1000 * gap_error:.2f} mm')
+        self.update_load_plot(frame)
         self._energy_plot_frame = frame
+
+    def update_load_plot(self, frame):
+        from viser import uplot
+        samples = np.concatenate(self.endpoint_history[:frame + 1], axis=0)
+        data = (samples[:, 0], samples[:, 1], samples[:, 2])
+        if self.load_chart is None:
+            with self.load_folder:
+                self.load_chart = self.viewer.server.gui.add_uplot(
+                    data=data, title='Endpoint force magnitude (N)',
+                    series=(uplot.Series(label='Time (s)'),
+                            uplot.Series(label='Pivot |F|', stroke='#ffbd3e', width=2),
+                            uplot.Series(label='Bob |F|', stroke='#7ebcff', width=2)),
+                    scales={'x': uplot.Scale(time=False)},
+                    axes=(uplot.Axis(label='Time (s)'), uplot.Axis(label='Force (N)')),
+                    height=230)
+        else:
+            self.load_chart.data = data
+        self.load_readout.content = (
+            f'**Pivot:** {samples[-1, 1]:.2f} N · peak {samples[:, 1].max():.2f} N  \n'
+            f'**Bob:** {samples[-1, 2]:.2f} N · peak {samples[:, 2].max():.2f} N')
 
     def update_viser_scene(self, state):
         transforms = state.body_q.numpy()
@@ -379,7 +459,16 @@ class Pendulum:
         np.savez_compressed(out / 'states.npz', time=rows[:, 0],
                             body_q=np.array(self.transforms), body_qd=np.array(self.velocities),
                             cable_nodes=np.array(self.nodes), energies=np.array(self.energies),
-                            energy_columns=np.array(ENERGY_COLUMNS))
+                            energy_columns=np.array(ENERGY_COLUMNS),
+                            endpoint_loads=np.concatenate(self.endpoint_history, axis=0))
+        loads = np.concatenate(self.endpoint_history, axis=0)
+        with (out / 'tensions.csv').open('w') as f:
+            writer = csv.writer(f)
+            writer.writerow(['time_s', 'pivot_force_magnitude_N', 'bob_force_magnitude_N',
+                             'pivot_signed_axial_N', 'bob_signed_axial_N',
+                             'pivot_force_on_cable_x_N', 'pivot_force_on_cable_y_N', 'pivot_force_on_cable_z_N',
+                             'bob_force_on_bob_x_N', 'bob_force_on_bob_y_N', 'bob_force_on_bob_z_N'])
+            writer.writerows(loads)
         with (out / 'energies.csv').open('w') as f:
             writer = csv.writer(f)
             writer.writerow(['time_s', *ENERGY_COLUMNS])
@@ -397,15 +486,29 @@ class Pendulum:
                        max_abs_system_energy_drift_J=float(np.max(np.abs(np.asarray(self.energies)[:, -1]))),
                        max_abs_system_energy_drift_percent=float(100 * np.max(np.abs(np.asarray(self.energies)[:, -1])) / self.energies[0][-2]),
                        min_bob_z_m=float(rows[:, 3].min()))
+        summary['endpoint_loads'] = dict(
+            definition='Elastic attachment resultant k * displacement; axial sign positive in tension',
+            sample_dt_s=self.dt, peak_pivot_force_N=float(loads[:, 1].max()),
+            peak_bob_force_N=float(loads[:, 2].max()))
+        issues = []
+        if summary['max_pin_error_m'] > 0.01:
+            issues.append(f"Top pin displacement {1000 * summary['max_pin_error_m']:.2f} mm exceeds 10 mm")
+        if summary['max_attachment_gap_m'] > 0.01:
+            issues.append(f"Cable/bob attachment gap {1000 * summary['max_attachment_gap_m']:.2f} mm exceeds 10 mm")
+        summary['constraint_validation'] = dict(passed=not issues, tolerance_m=0.01, issues=issues)
         (out / 'summary.json').write_text(json.dumps(summary, indent=2))
         template = Path(__file__).with_name('playback.html').read_text()
         data = dict(time=rows[:, 0].round(4).tolist(), nodes=np.array(self.nodes).round(4).tolist(),
                     bob=rows[:, 1:4].round(4).tolist(), speed=rows[:, 4].round(3).tolist(),
                     pivot=self.pivot.tolist(), length=self.args.length, parameters=vars(self.args))
         (out / 'pendulum.html').write_text(template.replace('/*SIMULATION_DATA*/null', json.dumps(data, separators=(',', ':'))))
-        if summary['max_pin_error_m'] > 0.01 or summary['max_attachment_gap_m'] > 0.01:
-            raise RuntimeError('Constraint error exceeds 1 cm; increase substeps/iterations.')
         print(json.dumps(summary, indent=2))
+        if issues:
+            message = '; '.join(issues) + '. Results saved; this run failed constraint validation.'
+            if getattr(self.args, 'strict_validation', False):
+                raise RuntimeError(message)
+            suffix = ' Viser remains available for inspection.' if self.args.viewer == 'viser' else ''
+            print(f'WARNING: {message}{suffix}', flush=True)
 
 
 def main():
@@ -415,7 +518,7 @@ def main():
     parser.add_argument('--bob-mass', type=float, default=1)
     parser.add_argument('--radius', type=float, default=0.003, help='Illustrative cable radius, m')
     parser.add_argument('--bob-radius', type=float, default=0.15)
-    parser.add_argument('--angle', type=float, default=90, help='Degrees from downward vertical')
+    parser.add_argument('--angle', type=float, default=160, help='Degrees from downward vertical')
     parser.add_argument('--ei', type=float, default=0.05, help='Bending rigidity, N m^2')
     parser.add_argument('--gj', type=float, default=0.02, help='Torsional rigidity, N m^2')
     parser.add_argument('--ea', type=float, default=1e5, help='Axial rigidity, N')
@@ -432,6 +535,8 @@ def main():
     parser.add_argument('--port', type=int, default=8080, help='Viser HTTP port')
     parser.add_argument('--autoplay', action='store_true', help='Start Viser simulation without pausing')
     parser.add_argument('--exit-on-finish', action='store_true', help='Close Viser after simulation instead of showing recorded playback')
+    parser.add_argument('--strict-validation', action='store_true',
+                        help='Exit with an error on failed attachment validation; otherwise warn and keep the replay available')
     parser.add_argument('--output', default='results')
     args = parser.parse_args()
     for name in ['length', 'linear_density', 'bob_mass', 'radius', 'bob_radius', 'ea', 'duration', 'fps', 'substeps', 'iterations']:
